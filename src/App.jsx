@@ -2,7 +2,37 @@ import { useEffect, useMemo, useState } from 'react';
 import shp from 'shpjs';
 import ChartsPanel from './components/ChartsPanel';
 import MapPanel from './components/MapPanel';
-import { aggregateSelection, cellCoverageRatio, geoJsonToLatLngBounds, geometryToProjectedPolygons } from './utils';
+import {
+  aggregateSelection,
+  buildQuantileScale,
+  cellCoverageRatio,
+  geoJsonToLatLngBounds,
+  geometryToProjectedPolygons,
+} from './utils';
+
+function createEmptySelection() {
+  return {
+    ids: new Set(),
+    adminId: null,
+    geoJson: null,
+    label: '',
+    selectionMode: 'intersect',
+    weights: null,
+    manualDirty: false,
+  };
+}
+
+function buildYearRange(years, fromYear, toYear) {
+  const fromIndex = years.indexOf(fromYear);
+  const toIndex = years.indexOf(toYear);
+  if (fromIndex === -1 || toIndex === -1) {
+    return [];
+  }
+
+  const start = Math.min(fromIndex, toIndex);
+  const end = Math.max(fromIndex, toIndex);
+  return years.slice(start, end + 1);
+}
 
 async function fetchJson(path, options = {}) {
   const { optional = false } = options;
@@ -73,6 +103,7 @@ function collectCellsForFeatureCollection(featureCollection, gridIndex, mode = '
 
   const selected = new Set();
   const weights = new Map();
+
   featureCollection.features.forEach((feature) => {
     const polygons = geometryToProjectedPolygons(feature.geometry);
     if (polygons.length === 0) {
@@ -89,7 +120,6 @@ function collectCellsForFeatureCollection(featureCollection, gridIndex, mode = '
     gridIndex.cell_ids.forEach((cellId, index) => {
       const x = gridIndex.x_coords[index];
       const y = gridIndex.y_coords[index];
-
       if (x < minX || x > maxX || y < minY || y > maxY) {
         return;
       }
@@ -111,40 +141,34 @@ function collectCellsForFeatureCollection(featureCollection, gridIndex, mode = '
   return { selected, weights };
 }
 
-function decorateFeatureCollection(featureCollection, activeYear, selectedYears, yearDataMap, cellIdToIndex, gridIndex) {
+function decorateFeatureCollection(featureCollection, activeYear, selectedYears, yearDataMap, selectedIds, selectionWeights, cellIdToIndex) {
   const activeFields = yearDataMap[activeYear]?.fields || [];
+  const activeAggregate = aggregateSelection(selectedIds, yearDataMap[activeYear], cellIdToIndex, selectionWeights);
+  const timeline = Object.fromEntries(
+    selectedYears.map((year) => [year, aggregateSelection(selectedIds, yearDataMap[year], cellIdToIndex, selectionWeights)]),
+  );
+
   return {
     ...featureCollection,
-    features: featureCollection.features.map((feature) => {
-      const featureCollectionSingle = { type: 'FeatureCollection', features: [feature] };
-      const cellIds = collectCellsForFeatureCollection(featureCollectionSingle, gridIndex, 'intersect').selected;
-      const activeAggregate = aggregateSelection(cellIds, yearDataMap[activeYear], cellIdToIndex);
-      const timeline = Object.fromEntries(
-        selectedYears.map((year) => [year, aggregateSelection(cellIds, yearDataMap[year], cellIdToIndex)]),
-      );
-      const averages = Object.fromEntries(
-        activeFields.map((field) => [
-          `avg_${field}`,
-          cellIds.size > 0 && activeAggregate && Number.isFinite(activeAggregate[field])
-            ? Number((activeAggregate[field] / cellIds.size).toFixed(4))
-            : null,
-        ]),
-      );
-
-      return {
-        ...feature,
-        properties: {
-          ...feature.properties,
-          analysis_year: activeYear,
-          selected_cell_count: cellIds.size,
-          ...averages,
-          ...Object.fromEntries(
-            Object.entries(activeAggregate || {}).map(([key, value]) => [key, value ?? null]),
-          ),
-          timeline,
-        },
-      };
-    }),
+    features: featureCollection.features.map((feature) => ({
+      ...feature,
+      properties: {
+        ...feature.properties,
+        analysis_year: activeYear,
+        selected_cell_count: selectedIds.size,
+        weighted_selection: Boolean(selectionWeights),
+        ...Object.fromEntries(
+          activeFields.map((field) => [
+            `avg_${field}`,
+            selectedIds.size > 0 && activeAggregate && Number.isFinite(activeAggregate[field])
+              ? Number((activeAggregate[field] / selectedIds.size).toFixed(4))
+              : null,
+          ]),
+        ),
+        ...Object.fromEntries(Object.entries(activeAggregate || {}).map(([key, value]) => [key, value ?? null])),
+        timeline,
+      },
+    })),
   };
 }
 
@@ -154,17 +178,16 @@ export default function App() {
   const [adminData, setAdminData] = useState(null);
   const [yearDataMap, setYearDataMap] = useState({});
   const [activeYear, setActiveYear] = useState('');
-  const [selectedYears, setSelectedYears] = useState([]);
-  const [selectedIds, setSelectedIds] = useState(new Set());
-  const [selectedAdminId, setSelectedAdminId] = useState(null);
+  const [yearRange, setYearRange] = useState({ from: '', to: '' });
   const [status, setStatus] = useState('Nalagam podatke ...');
   const [error, setError] = useState(null);
-  const [geometryClearToken, setGeometryClearToken] = useState(0);
-  const [selectionClearToken, setSelectionClearToken] = useState(0);
-  const [uploadedGeoJson, setUploadedGeoJson] = useState(null);
-  const [uploadedLabel, setUploadedLabel] = useState('');
-  const [uploadedSelectionMode, setUploadedSelectionMode] = useState('intersect');
-  const [selectionWeights, setSelectionWeights] = useState(null);
+  const [selectionState, setSelectionState] = useState({
+    primary: createEmptySelection(),
+    secondary: createEmptySelection(),
+  });
+  const [activeSelectionSlot, setActiveSelectionSlot] = useState('primary');
+  const [isYearLoading, setIsYearLoading] = useState(false);
+  const [selectedTrendMetric, setSelectedTrendMetric] = useState('pct_p65_');
 
   useEffect(() => {
     async function loadBootstrap() {
@@ -181,10 +204,13 @@ export default function App() {
           return;
         }
 
+        const latestYear = manifestData.years.at(-1);
+        const earliestYear = manifestData.years.at(0);
+
         setManifest(manifestData);
         setGridIndex(gridData);
-        setActiveYear(manifestData.years.at(-1));
-        setSelectedYears(manifestData.years);
+        setActiveYear(latestYear);
+        setYearRange({ from: earliestYear, to: latestYear });
 
         if (adminGeojson && adminCells) {
           setAdminData({
@@ -206,6 +232,13 @@ export default function App() {
     loadBootstrap();
   }, []);
 
+  const selectedYears = useMemo(() => {
+    if (!manifest) {
+      return [];
+    }
+    return buildYearRange(manifest.years, yearRange.from, yearRange.to);
+  }, [manifest, yearRange]);
+
   useEffect(() => {
     async function ensureYearsLoaded() {
       if (!manifest) {
@@ -218,6 +251,7 @@ export default function App() {
         return;
       }
 
+      setIsYearLoading(true);
       try {
         const loaded = await Promise.all(
           missingYears.map(async (year) => [year, await fetchJson(`./data/attributes/${year}.json`)]),
@@ -233,6 +267,8 @@ export default function App() {
         });
       } catch (loadError) {
         setError(loadError.message);
+      } finally {
+        setIsYearLoading(false);
       }
     }
 
@@ -246,73 +282,168 @@ export default function App() {
     return new Map(gridIndex.cell_ids.map((cellId, index) => [cellId, index]));
   }, [gridIndex]);
 
+  const quantileScale = useMemo(
+    () => buildQuantileScale(yearDataMap[activeYear]?.columns?.tot_p || []),
+    [activeYear, yearDataMap],
+  );
+
+  const allCellIds = useMemo(() => new Set(gridIndex?.cell_ids || []), [gridIndex]);
+  const effectivePrimaryIds = selectionState.primary.ids.size > 0 ? selectionState.primary.ids : allCellIds;
+  const combinedSelection = useMemo(() => {
+    const ids = new Set(effectivePrimaryIds);
+    selectionState.secondary.ids.forEach((cellId) => ids.add(cellId));
+    const weights = new Map(selectionState.primary.weights || []);
+    if (selectionState.secondary.weights) {
+      selectionState.secondary.weights.forEach((value, key) => {
+        if (!weights.has(key)) {
+          weights.set(key, value);
+        }
+      });
+    }
+    return { ids, weights: weights.size > 0 ? weights : null };
+  }, [effectivePrimaryIds, selectionState.primary.weights, selectionState.secondary.ids, selectionState.secondary.weights]);
+
   const aggregatedByYear = useMemo(() => {
     if (!gridIndex || selectedYears.length === 0) {
       return {};
     }
 
-      return Object.fromEntries(
+    return Object.fromEntries(
       selectedYears.map((year) => [
         year,
-        aggregateSelection(selectedIds, yearDataMap[year], cellIdToIndex, selectionWeights),
+        aggregateSelection(effectivePrimaryIds, yearDataMap[year], cellIdToIndex, selectionState.primary.weights),
       ]),
-      );
-  }, [gridIndex, selectedIds, selectedYears, yearDataMap, cellIdToIndex, selectionWeights]);
+    );
+  }, [gridIndex, selectedYears, yearDataMap, cellIdToIndex, effectivePrimaryIds, selectionState.primary.weights]);
+
+  const comparisonAggregatedByYear = useMemo(() => {
+    if (!gridIndex || selectedYears.length === 0) {
+      return {};
+    }
+
+    return Object.fromEntries(
+      selectedYears.map((year) => [
+        year,
+        aggregateSelection(selectionState.secondary.ids, yearDataMap[year], cellIdToIndex, selectionState.secondary.weights),
+      ]),
+    );
+  }, [gridIndex, selectedYears, yearDataMap, cellIdToIndex, selectionState.secondary.ids, selectionState.secondary.weights]);
+
+  const combinedAggregatedByYear = useMemo(() => {
+    if (!gridIndex || selectedYears.length === 0) {
+      return {};
+    }
+
+    return Object.fromEntries(
+      selectedYears.map((year) => [
+        year,
+        aggregateSelection(combinedSelection.ids, yearDataMap[year], cellIdToIndex, combinedSelection.weights),
+      ]),
+    );
+  }, [gridIndex, selectedYears, yearDataMap, cellIdToIndex, combinedSelection]);
 
   const activeAggregate = aggregatedByYear[activeYear] || null;
+  const comparisonAggregate = comparisonAggregatedByYear[activeYear] || null;
+  const combinedAggregate = combinedAggregatedByYear[activeYear] || null;
+  const activeSlot = selectionState[activeSelectionSlot];
+  const secondaryEnabled = Boolean(selectionState.primary.geoJson);
 
-  const clearSelection = () => {
-    setSelectedIds(new Set());
-    setSelectedAdminId(null);
-    setSelectionWeights(null);
-    setSelectionClearToken((value) => value + 1);
+  const updateSlot = (slotKey, updater) => {
+    setSelectionState((current) => ({
+      ...current,
+      [slotKey]: updater(current[slotKey]),
+    }));
   };
 
-  const clearPolygons = (clearSelectionToo = false) => {
-    setUploadedGeoJson(null);
-    setUploadedLabel('');
-    setSelectionWeights(null);
-    setGeometryClearToken((value) => value + 1);
-    if (clearSelectionToo) {
-      clearSelection();
-    }
-  };
-
-  const handleToggleCell = (cellId) => {
-    setSelectedAdminId(null);
-    setSelectionWeights(null);
-    setSelectedIds((current) => {
-      const next = new Set(current);
-      if (next.has(cellId)) {
-        next.delete(cellId);
-      } else {
-        next.add(cellId);
-      }
-      return next;
-    });
-  };
-
-  const handleReplaceSelection = (cellIds, mode = 'replace') => {
-    setSelectedAdminId(null);
-    setSelectedIds((current) => {
-      if (mode === 'replace') {
-        return new Set(cellIds);
-      }
-      const next = new Set(current);
-      cellIds.forEach((cellId) => next.add(cellId));
-      return next;
-    });
-  };
-
-  const handleSelectAdmin = (adminId) => {
-    setSelectedAdminId(adminId);
-    if (!adminId || !adminData?.mapping?.[adminId]) {
-      setSelectedIds(new Set());
-      setSelectionWeights(null);
+  const clearSlot = (slotKey) => {
+    if (slotKey === 'primary') {
+      setSelectionState({
+        primary: createEmptySelection(),
+        secondary: createEmptySelection(),
+      });
+      setActiveSelectionSlot('primary');
       return;
     }
-    setSelectedIds(new Set(adminData.mapping[adminId]));
-    setSelectionWeights(null);
+
+    updateSlot(slotKey, () => createEmptySelection());
+  };
+
+  const clearAllSelections = () => {
+    setSelectionState({
+      primary: createEmptySelection(),
+      secondary: createEmptySelection(),
+    });
+    setActiveSelectionSlot('primary');
+  };
+
+  const handleToggleCell = (cellId, slotKey = activeSelectionSlot) => {
+    updateSlot(slotKey, (slot) => {
+      const nextIds = new Set(slot.ids);
+      if (nextIds.has(cellId)) {
+        nextIds.delete(cellId);
+      } else {
+        nextIds.add(cellId);
+      }
+
+      return {
+        ...slot,
+        ids: nextIds,
+        adminId: null,
+        weights: null,
+        manualDirty: slot.manualDirty || Boolean(slot.geoJson),
+      };
+    });
+  };
+
+  const handleReplaceSelection = (slotKey, cellIds, options = {}) => {
+    const { adminId = null, geoJson, label, weights = null, manualDirty } = options;
+
+    updateSlot(slotKey, (slot) => ({
+      ...slot,
+      ids: new Set(cellIds),
+      adminId,
+      weights,
+      geoJson: geoJson ?? slot.geoJson,
+      label: label ?? slot.label,
+      manualDirty: manualDirty ?? (geoJson ? false : slot.manualDirty),
+    }));
+  };
+
+  const handleSelectAdmin = (adminId, slotKey = activeSelectionSlot) => {
+    if (!adminId || !adminData?.mapping?.[adminId]) {
+      updateSlot(slotKey, (slot) => ({
+        ...slot,
+        adminId: null,
+        ids: new Set(),
+        weights: null,
+      }));
+      return;
+    }
+
+    handleReplaceSelection(slotKey, adminData.mapping[adminId], {
+      adminId,
+      weights: null,
+      manualDirty: Boolean(selectionState[slotKey].geoJson),
+    });
+  };
+
+  const applyPolygonToSlot = (slotKey, featureCollection, label) => {
+    if (!gridIndex || !featureCollection) {
+      return;
+    }
+
+    const mode = selectionState[slotKey].selectionMode;
+    const selectedFromPolygon = collectCellsForFeatureCollection(featureCollection, gridIndex, mode);
+    handleReplaceSelection(slotKey, selectedFromPolygon.selected, {
+      geoJson: featureCollection,
+      label,
+      weights: selectedFromPolygon.weights.size > 0 ? selectedFromPolygon.weights : null,
+      manualDirty: false,
+    });
+  };
+
+  const handleDrawPolygon = (featureCollection, slotKey = activeSelectionSlot) => {
+    applyPolygonToSlot(slotKey, featureCollection, slotKey === 'primary' ? 'P1' : 'P2');
   };
 
   const handleUploadPolygon = async (event) => {
@@ -336,12 +467,7 @@ export default function App() {
         throw new Error('V vhodni datoteki ni podprte poligonske geometrije.');
       }
 
-      const selectedFromUpload = collectCellsForFeatureCollection(parsed, gridIndex, uploadedSelectionMode);
-      setUploadedGeoJson(parsed);
-      setUploadedLabel(file.name);
-      setSelectedAdminId(null);
-      setSelectedIds(selectedFromUpload.selected);
-      setSelectionWeights(selectedFromUpload.weights.size > 0 ? selectedFromUpload.weights : null);
+      applyPolygonToSlot(activeSelectionSlot, parsed, file.name);
     } catch (uploadError) {
       setError(uploadError.message);
     } finally {
@@ -349,37 +475,41 @@ export default function App() {
     }
   };
 
-  const handleExportUploadedPolygon = () => {
-    if (!uploadedGeoJson || !activeYear) {
+  const handleSelectionModeChange = (slotKey, mode) => {
+    updateSlot(slotKey, (slot) => ({ ...slot, selectionMode: mode }));
+    const geoJson = selectionState[slotKey].geoJson;
+    if (geoJson && gridIndex) {
+      const recalculated = collectCellsForFeatureCollection(geoJson, gridIndex, mode);
+      handleReplaceSelection(slotKey, recalculated.selected, {
+        weights: recalculated.weights.size > 0 ? recalculated.weights : null,
+        manualDirty: false,
+      });
+    }
+  };
+
+  const handleExportActivePolygon = () => {
+    if (!activeSlot.geoJson || !activeYear) {
       return;
     }
 
+    const exportIds = activeSlot.ids.size > 0 ? activeSlot.ids : (activeSelectionSlot === 'primary' ? effectivePrimaryIds : activeSlot.ids);
     const decorated = decorateFeatureCollection(
-      uploadedGeoJson,
+      activeSlot.geoJson,
       activeYear,
       selectedYears,
       yearDataMap,
+      exportIds,
+      activeSlot.weights,
       cellIdToIndex,
-      gridIndex,
     );
     const blob = new Blob([JSON.stringify(decorated, null, 2)], { type: 'application/geo+json' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = `poligon-analiza-${activeYear}.geojson`;
+    link.download = `poligon-${activeSelectionSlot}-${activeYear}.geojson`;
     link.click();
     URL.revokeObjectURL(url);
   };
-
-  useEffect(() => {
-    if (!uploadedGeoJson || !gridIndex) {
-      return;
-    }
-
-    const recalculated = collectCellsForFeatureCollection(uploadedGeoJson, gridIndex, uploadedSelectionMode);
-    setSelectedIds(recalculated.selected);
-    setSelectionWeights(recalculated.weights.size > 0 ? recalculated.weights : null);
-  }, [uploadedGeoJson, gridIndex, uploadedSelectionMode]);
 
   if (error) {
     return <main className="app-shell"><section className="notice notice--error">{error}</section></main>;
@@ -392,17 +522,39 @@ export default function App() {
   return (
     <main className="app-shell">
       <section className="workspace">
-        <aside className="sidebar-panel">
-          <div className="sidebar-header">
-            <p className="eyebrow">Statična GitHub Pages aplikacija</p>
-            <h1>Demografija 100 x 100 m</h1>
-            <p>Levo je izbor podatkov in karta, desno pa analitični grafi za izbrano območje.</p>
+        <aside className={`sidebar-panel ${activeSelectionSlot === 'primary' ? 'sidebar-panel--primary' : 'sidebar-panel--secondary'}`}>
+          <div className="sidebar-header sidebar-header--compact">
+            <div>
+              <p className="eyebrow">100-stat: demografska statistika po SURS celicah 100 x 100 m</p>
+            </div>
+            <div
+              className="slot-switch"
+              title="Preklopi, za kateri poligon trenutno veljajo upload, kliki na karto in vse spodnje nastavitve."
+            >
+              <button
+                type="button"
+                className={`button button--chip ${activeSelectionSlot === 'primary' ? 'button--slot-primary' : 'button--ghost'}`}
+                onClick={() => setActiveSelectionSlot('primary')}
+                title="Urejaš prvi poligon. Vsi kliki na karto in upload veljajo zanj."
+              >
+                P1
+              </button>
+              <button
+                type="button"
+                className={`button button--chip ${activeSelectionSlot === 'secondary' ? 'button--slot-secondary' : 'button--ghost'}`}
+                onClick={() => setActiveSelectionSlot('secondary')}
+                disabled={!secondaryEnabled}
+                title={secondaryEnabled ? 'Urejaš drugi poligon. Vsi kliki na karto in upload veljajo zanj.' : 'Drugi poligon se odklene, ko najprej zaključiš ali uvoziš prvi poligon.'}
+              >
+                P2
+              </button>
+            </div>
           </div>
 
-          <div className="control-grid">
+          <div className="control-grid control-grid--compact">
             <label className="control">
-              <span>Aktivno leto</span>
-              <select value={activeYear} onChange={(event) => setActiveYear(event.target.value)}>
+              <span>Leto</span>
+              <select value={activeYear} onChange={(event) => setActiveYear(event.target.value)} title="Izberi leto, za katero se obarva karta in osvežijo glavni kazalniki.">
                 {manifest.years.map((year) => (
                   <option key={year} value={year}>
                     {year}
@@ -411,97 +563,140 @@ export default function App() {
               </select>
             </label>
 
+            <div className="control">
+              <span>Trend od-do</span>
+              <div className="year-range">
+                <select
+                  value={yearRange.from}
+                  onChange={(event) => setYearRange((current) => ({ ...current, from: event.target.value }))}
+                  title="Začetno leto za časovne grafe."
+                >
+                  {manifest.years.map((year) => (
+                    <option key={year} value={year}>
+                      {year}
+                    </option>
+                  ))}
+                </select>
+                <select
+                  value={yearRange.to}
+                  onChange={(event) => setYearRange((current) => ({ ...current, to: event.target.value }))}
+                  title="Končno leto za časovne grafe."
+                >
+                  {manifest.years.map((year) => (
+                    <option key={year} value={year}>
+                      {year}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
             <label className="control">
-              <span>Leta za časovno vrsto</span>
+              <span>
+                Način preseka
+                <span
+                  className="inline-help"
+                  tabIndex={0}
+                  title="Meja seka vrne vse dosežene celice. V celoti znotraj je strožji filter. Utežen izračun je najbolj smiseln za populacijske števce; deleži in kazalniki so pri takem rezu približek."
+                >
+                  (i)
+                </span>
+              </span>
               <select
-                multiple
-                value={selectedYears}
-                onChange={(event) =>
-                  setSelectedYears(
-                    (() => {
-                      const values = Array.from(event.target.selectedOptions).map((option) => option.value).sort();
-                      return values.length > 0 ? values : [activeYear];
-                    })(),
-                  )
+                value={activeSlot.selectionMode}
+                onChange={(event) => handleSelectionModeChange(activeSelectionSlot, event.target.value)}
+                title={
+                  activeSlot.selectionMode === 'intersect'
+                    ? 'Meja seka vrne vse dosežene celice.'
+                    : activeSlot.selectionMode === 'within'
+                      ? 'V celoti znotraj je strožji filter.'
+                      : 'Utežen izračun je najbolj smiseln za populacijske števce; deleži in kazalniki so pri takem rezu približek.'
                 }
               >
-                {manifest.years.map((year) => (
-                  <option key={year} value={year}>
-                    {year}
-                  </option>
-                ))}
+                <option value="intersect">Celice, ki jih meja seka</option>
+                <option value="within">Celice v celoti znotraj</option>
+                <option value="weighted_population">Utežen izračun po deležu preseka</option>
               </select>
             </label>
 
             <label className="control control--wide">
-              <span>Naloži svoj poligon</span>
-              <input type="file" accept=".geojson,.json,.zip,.shp" onChange={handleUploadPolygon} />
+              <span>Naloži poligon</span>
+              <input
+                type="file"
+                accept=".geojson,.json,.zip,.shp"
+                onChange={handleUploadPolygon}
+                title="Naloži GeoJSON ali shapefile za trenutno aktivni poligon."
+              />
             </label>
 
-            {uploadedGeoJson && (
-              <div className="control compact-control control--wide">
-                <span>Način obračuna za uvožen poligon</span>
-                <label className="check-option">
-                  <input
-                    type="radio"
-                    name="upload-mode"
-                    checked={uploadedSelectionMode === 'intersect'}
-                    onChange={() => setUploadedSelectionMode('intersect')}
-                  />
-                  <span>Izberi celice, ki jih meja seka</span>
-                </label>
-                <label className="check-option">
-                  <input
-                    type="radio"
-                    name="upload-mode"
-                    checked={uploadedSelectionMode === 'within'}
-                    onChange={() => setUploadedSelectionMode('within')}
-                  />
-                  <span>Izberi celice, ki so v celoti znotraj poligona</span>
-                </label>
-                <label className="check-option">
-                  <input
-                    type="radio"
-                    name="upload-mode"
-                    checked={uploadedSelectionMode === 'weighted_population'}
-                    onChange={() => setUploadedSelectionMode('weighted_population')}
-                  />
-                  <span>Uteži prebivalstvo glede na delež celice v poligonu</span>
-                </label>
-              </div>
+            {adminData?.options?.length > 0 && (
+              <label className="control">
+                <span>Občina</span>
+                <select
+                  value={activeSlot.adminId || ''}
+                  onChange={(event) => handleSelectAdmin(event.target.value || null, activeSelectionSlot)}
+                  title="Administrativni izbor nadomesti trenutni izbor aktivnega poligona."
+                >
+                  <option value="">Brez administrativnega izbora</option>
+                  {adminData.options.map((option) => (
+                    <option key={option.id} value={option.id}>
+                      {option.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
             )}
 
-            <div className="button-row control--wide">
-              <button type="button" className="button" onClick={clearSelection}>
-                Počisti izbor
-              </button>
+            <div className="selection-summary">
+              <div>
+                <strong>{activeSelectionSlot === 'primary' ? 'P1' : 'P2'}</strong>
+                <p>{activeSlot.ids.size} celic, način: {activeSlot.selectionMode}</p>
+              </div>
+              {isYearLoading ? <span className="loading-pill">Nalagam leta ...</span> : null}
             </div>
 
-            {uploadedGeoJson && (
-              <div className="upload-summary control--wide">
-                <span>{uploadedLabel}</span>
-                <button type="button" className="button button--secondary" onClick={handleExportUploadedPolygon}>
-                  Izvozi obogaten poligon
-                </button>
-              </div>
-            )}
+            <div className="button-row button-row--compact control--wide">
+              <button
+                type="button"
+                className="button button--ghost"
+                onClick={() => clearSlot(activeSelectionSlot)}
+                title="Počisti izbor in geometrijo trenutno aktivnega poligona."
+              >
+                Počisti aktivni
+              </button>
+              <button
+                type="button"
+                className="button button--ghost"
+                onClick={clearAllSelections}
+                title="Ponastavi oba poligona in odstrani vse izbore."
+              >
+                Ponastavi vse
+              </button>
+              <button
+                type="button"
+                className="button button--secondary"
+                onClick={handleExportActivePolygon}
+                disabled={!activeSlot.geoJson}
+                title={!activeSlot.geoJson
+                  ? 'Najprej nariši ali naloži geometrijo aktivnega poligona.'
+                  : 'Izvozi obogaten GeoJSON za trenutno aktivni poligon, kot je trenutno prikazan na karti.'}
+              >
+                Izvozi
+              </button>
+            </div>
           </div>
 
           <MapPanel
             gridIndex={gridIndex}
-            selectedIds={selectedIds}
-            onToggleCell={handleToggleCell}
-            onReplaceSelection={handleReplaceSelection}
             yearData={yearDataMap[activeYear]}
-            adminData={adminData}
-            selectedAdminId={selectedAdminId}
-            onSelectAdmin={handleSelectAdmin}
-            uploadedGeoJson={uploadedGeoJson}
-            uploadedBounds={geoJsonToLatLngBounds(uploadedGeoJson)}
-            geometryClearToken={geometryClearToken}
-            selectionClearToken={selectionClearToken}
-            onClearSelection={clearSelection}
-            onClearPolygons={clearPolygons}
+            quantileScale={quantileScale}
+            selectionState={selectionState}
+            activeSelectionSlot={activeSelectionSlot}
+            onSetActiveSelectionSlot={setActiveSelectionSlot}
+            onToggleCell={handleToggleCell}
+            onDrawPolygon={handleDrawPolygon}
+            primaryBounds={geoJsonToLatLngBounds(selectionState.primary.geoJson)}
+            secondaryBounds={geoJsonToLatLngBounds(selectionState.secondary.geoJson)}
           />
         </aside>
 
@@ -509,8 +704,16 @@ export default function App() {
           <ChartsPanel
             selectedYears={selectedYears}
             aggregatedByYear={aggregatedByYear}
+            comparisonAggregatedByYear={comparisonAggregatedByYear}
             latestAggregate={activeAggregate}
-            selectedCount={selectedIds.size}
+            comparisonLatestAggregate={comparisonAggregate}
+            combinedLatestAggregate={combinedAggregate}
+            selectedCount={selectionState.primary.ids.size}
+            comparisonCount={selectionState.secondary.ids.size}
+            usesNationalFallback={selectionState.primary.ids.size === 0}
+            selectedTrendMetric={selectedTrendMetric}
+            onSelectedTrendMetricChange={setSelectedTrendMetric}
+            isYearLoading={isYearLoading}
           />
         </section>
       </section>

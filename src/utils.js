@@ -1,10 +1,12 @@
 import proj4 from 'proj4';
-import { ABSOLUTE_FIELDS, PROJECTED_CRS, WEIGHTED_MEAN_FIELDS } from './config';
+import { ABSOLUTE_FIELDS, FIVE_YEAR_FIELDS, PROJECTED_CRS, WEIGHTED_MEAN_FIELDS } from './config';
 
 proj4.defs(
   PROJECTED_CRS,
   '+proj=tmerc +lat_0=0 +lon_0=15 +k=0.9999 +x_0=500000 +y_0=-5000000 +ellps=GRS80 +units=m +no_defs',
 );
+
+const POPULATION_WEIGHTED_FIELDS = new Set(ABSOLUTE_FIELDS.filter((field) => !field.startsWith('edct_')));
 
 export function parseCellId(cellId) {
   const parts = `${cellId}`.split('_');
@@ -67,7 +69,75 @@ export function safeDivide(numerator, denominator, multiplier = 1) {
   return (numerator / denominator) * multiplier;
 }
 
-const POPULATION_WEIGHTED_FIELDS = new Set(ABSOLUTE_FIELDS.filter((field) => !field.startsWith('edct_')));
+export function buildQuantileScale(values, classCount = 5) {
+  const numericValues = values
+    .map((value) => Number(value))
+    .filter((value) => Number.isFinite(value) && value > 0)
+    .sort((a, b) => a - b);
+
+  const colors = [
+    'rgba(255, 243, 176, 0.50)',
+    'rgba(254, 197, 111, 0.50)',
+    'rgba(247, 151, 84, 0.50)',
+    'rgba(227, 93, 71, 0.50)',
+    'rgba(159, 31, 41, 0.50)',
+  ].slice(0, classCount);
+  if (numericValues.length === 0) {
+    return {
+      thresholds: [],
+      colors,
+      bins: colors.map((color, index) => ({
+        color,
+        min: index === 0 ? 0 : null,
+        max: null,
+        label: index === 0 ? 'Ni podatka / 0' : '',
+      })),
+    };
+  }
+
+  const breakFractions = classCount === 5 ? [0.35, 0.6, 0.8, 0.95] : Array.from({ length: classCount - 1 }, (_, index) => (index + 1) / classCount);
+  const thresholds = breakFractions.map((fraction) => {
+    const position = Math.floor((numericValues.length - 1) * fraction);
+    return numericValues[Math.max(position, 0)];
+  });
+
+  const dedupedThresholds = thresholds.filter((value, index) => index === 0 || value > thresholds[index - 1]);
+  const bins = [];
+  let previous = 0;
+
+  dedupedThresholds.forEach((threshold, index) => {
+    bins.push({
+      color: colors[index],
+      min: index === 0 ? 0 : previous,
+      max: threshold,
+      label: `${formatMetric(index === 0 ? 0 : previous, 0)} - ${formatMetric(threshold, 0)}`,
+    });
+    previous = threshold;
+  });
+
+  bins.push({
+    color: colors[Math.min(dedupedThresholds.length, colors.length - 1)],
+    min: previous,
+    max: Infinity,
+    label: `${formatMetric(previous, 0)}+`,
+  });
+
+  return { thresholds: dedupedThresholds, colors, bins };
+}
+
+export function getColorForValue(value, quantileScale) {
+  if (!Number.isFinite(value) || value <= 0) {
+    return 'rgba(255, 243, 176, 0.10)';
+  }
+
+  const thresholds = quantileScale?.thresholds || [];
+  const colors = quantileScale?.colors || ['#fff3b0', '#fec56f', '#f79754', '#e35d47', '#9f1f29'];
+  let classIndex = thresholds.findIndex((threshold) => value <= threshold);
+  if (classIndex === -1) {
+    classIndex = Math.min(thresholds.length, colors.length - 1);
+  }
+  return colors[classIndex];
+}
 
 export function aggregateSelection(selectedIds, yearData, cellIdToIndex, selectionWeights = null) {
   if (!yearData || selectedIds.size === 0) {
@@ -90,6 +160,7 @@ export function aggregateSelection(selectedIds, yearData, cellIdToIndex, selecti
       if (!column) {
         return;
       }
+
       const value = normalizeNumber(column[index]);
       if (value !== null) {
         const factor = selectionWeights?.get(cellId) ?? 1;
@@ -127,6 +198,34 @@ export function aggregateSelection(selectedIds, yearData, cellIdToIndex, selecti
   result.ind_age_m = safeDivide(result.m_65_, result.m_00_14, 100);
   result.ind_age_f = safeDivide(result.f_65_, result.f_00_14, 100);
   result.ind_fem = safeDivide(result.tot_f, result.tot_m, 100);
+
+  result.p_15_24 = (result.p_15_19 ?? 0) + (result.p_20_24 ?? 0);
+  result.p_75_plus = (result.p_75_79 ?? 0) + (result.p_80_84 ?? 0) + (result.p_85_ ?? 0);
+  result.p_80_plus = (result.p_80_84 ?? 0) + (result.p_85_ ?? 0);
+  result.sex_ratio_m_per_100_f = safeDivide(result.tot_m, result.tot_f, 100);
+  result.youth_dependency_ratio = safeDivide(result.p_00_14, result.p_15_64, 100);
+  result.old_age_dependency_ratio = safeDivide(result.p_65_, result.p_15_64, 100);
+  result.total_dependency_ratio = safeDivide((result.p_00_14 ?? 0) + (result.p_65_ ?? 0), result.p_15_64, 100);
+  result.potential_support_ratio = safeDivide(result.p_15_64, result.p_65_);
+  result.ageing_index = safeDivide(result.p_65_, result.p_00_14, 100);
+  result.share_65_plus = safeDivide(result.p_65_, result.tot_p, 100);
+  result.share_75_plus = safeDivide(result.p_75_plus, result.tot_p, 100);
+  result.longevity_index_80_in_65 = safeDivide(result.p_80_plus, result.p_65_, 100);
+  result.oldest_old_index_85_in_65 = safeDivide(result.p_85_, result.p_65_, 100);
+  result.youth_bulge_total = safeDivide(result.p_15_24, result.tot_p, 100);
+  result.edct_total = (result.edct_1 ?? 0) + (result.edct_2 ?? 0) + (result.edct_3 ?? 0);
+  result.share_edct_1 = safeDivide(result.edct_1, result.edct_total, 100);
+  result.share_edct_2 = safeDivide(result.edct_2, result.edct_total, 100);
+  result.share_edct_3 = safeDivide(result.edct_3, result.edct_total, 100);
+  result.education_high_low_ratio = safeDivide(result.edct_3, result.edct_1);
+  result.education_index = safeDivide(
+    (result.edct_1 ?? 0) + 2 * (result.edct_2 ?? 0) + 3 * (result.edct_3 ?? 0),
+    result.edct_total,
+  );
+
+  FIVE_YEAR_FIELDS.forEach((field) => {
+    result[`share_${field}`] = safeDivide(result[field], result.tot_p, 100);
+  });
 
   return result;
 }
@@ -231,19 +330,6 @@ export function formatMetric(value, digits = 0) {
   }).format(value);
 }
 
-export function getColorForValue(value, maxValue) {
-  if (!Number.isFinite(value) || value <= 0 || !Number.isFinite(maxValue) || maxValue <= 0) {
-    return 'rgba(255, 245, 157, 0.08)';
-  }
-
-  const ratio = Math.min(value / maxValue, 1);
-  if (ratio <= 0.05) return 'rgba(255, 245, 157, 0.18)';
-  if (ratio <= 0.15) return 'rgba(255, 213, 79, 0.28)';
-  if (ratio <= 0.35) return 'rgba(255, 167, 38, 0.38)';
-  if (ratio <= 0.6) return 'rgba(239, 108, 0, 0.5)';
-  return 'rgba(183, 28, 28, 0.64)';
-}
-
 export function geoJsonToLatLngBounds(geojson) {
   const coordinates = [];
 
@@ -292,16 +378,12 @@ export function polygonCoordinatesToProjectedRings(geometry) {
   }
 
   if (geometry.type === 'Polygon') {
-    return geometry.coordinates.map((ring) =>
-      ring.map((pair) => coordinateToProjected(pair)),
-    );
+    return geometry.coordinates.map((ring) => ring.map((pair) => coordinateToProjected(pair)));
   }
 
   if (geometry.type === 'MultiPolygon') {
     return geometry.coordinates.flatMap((polygon) =>
-      polygon.map((ring) =>
-        ring.map((pair) => coordinateToProjected(pair)),
-      ),
+      polygon.map((ring) => ring.map((pair) => coordinateToProjected(pair))),
     );
   }
 
