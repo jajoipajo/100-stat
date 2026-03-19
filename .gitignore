@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.DS_Store
+Thumbs.db
+__pycache__/
+.pytest_cache/
+.venv/
+vite.stdout.log
+vite.stderr.log
+Microsoft/
+podatki/
+.vscode/
